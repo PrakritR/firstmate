@@ -11,7 +11,14 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Lexer, commandPosition, splitProgram } from "./fm-arm-command-policy.mjs";
 
-const RECOVERY_SCRIPTS = new Set(["fm-wake-drain.sh", "fm-watch-arm.sh", "fm-teardown.sh"]);
+const RECOVERY_SCRIPTS = new Set([
+  "fm-wake-drain.sh",
+  "fm-watch-arm.sh",
+  "fm-watch-checkpoint.sh",
+  "fm-lock.sh",
+  "fm-session-start.sh",
+  "fm-teardown.sh",
+]);
 
 function parseArguments(argv) {
   const result = { command: "", root: "" };
