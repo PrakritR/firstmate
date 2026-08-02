@@ -45,6 +45,9 @@ The promotion is built on `integrate/prakrit-to-main`, which is never pushed to 
 GitHub closes the PR as merged only when `prakrit` carries nothing the promotion left behind; when it does not close, the body says so and the next promotion's record replaces it.
 Open **no other** PR unless the captain explicitly asks.
 
+**Destination is declared, never inferred.** Every GitHub call the record makes names its repository explicitly, taken from an optional `GITHUB_REPO <owner>/<name>` row in `config/proplane-agent-branches`, else the configured `GIT_ROOT`'s own `origin`, else a refusal.
+A call that names no repository resolves a fork to its **parent**, which on 2026-08-02 published fork-only work to an upstream project, so declaring the row is preferred over relying on the clone's remote.
+
 ## After changes land
 
 Promote and sync restart only the dev servers they touch (no browser, no full-port sweep).

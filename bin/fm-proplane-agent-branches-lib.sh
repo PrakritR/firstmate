@@ -33,6 +33,26 @@ fm_proplane_agent_git_root() {
   return 1
 }
 
+# The GitHub repository the ladder publishes to, as OWNER/NAME, from an optional
+# GITHUB_REPO row. Configuring it is how an operator states the destination
+# outright instead of letting a tool infer one: `gh` resolves a fork to its
+# PARENT by default, which is how a promotion record can land on a repository the
+# ladder never chose. Absent is not an error here; the caller decides whether to
+# derive a destination another explicit way or refuse.
+fm_proplane_agent_github_repo() {
+  local key value
+  [ -f "$FM_PROPLANE_AGENT_CONFIG" ] || return 1
+  while IFS=$'\t' read -r key value _; do
+    case "$key" in ''|'#'*) continue ;; esac
+    if [ "$key" = GITHUB_REPO ]; then
+      [ -n "$value" ] || return 1
+      printf '%s\n' "$value"
+      return 0
+    fi
+  done < "$FM_PROPLANE_AGENT_CONFIG"
+  return 1
+}
+
 # Prints one line per agent row: branch<TAB>worktree<TAB>port
 fm_proplane_agent_rows() {
   [ -f "$FM_PROPLANE_AGENT_CONFIG" ] || return 1

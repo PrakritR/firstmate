@@ -25,6 +25,13 @@
 # and a sandbox that promotes into prakrit in between would otherwise be invisible
 # to a reconciliation that claims to describe what GitHub shows.
 #
+# Destination: every GitHub call names its repository explicitly, resolved from
+# the ladder's own configuration. Nothing here lets the working directory decide
+# where a record is published, because a GitHub call with no repository resolves
+# a fork to its PARENT. On 2026-08-02 that published a private fork's work to an
+# upstream project. When the destination cannot be resolved this refuses instead
+# of falling back to whatever the tool would have picked.
+#
 # Sourced by bin/fm-proplane-promote-prakrit-to-main.sh (opens the PR) and
 # bin/fm-proplane-promote-full.sh (--dry-run preview). GitHub access goes
 # through gh-axi, per AGENTS.md.
@@ -62,6 +69,12 @@
 #     not finish landing.
 #   fm_proplane_promote_pr_report_label <path>
 #     The sha-keyed report filename alone, never the absolute local path.
+#   fm_proplane_promote_pr_repo <git_root>
+#     The OWNER/NAME every call above publishes to: the ladder config's
+#     GITHUB_REPO row, else that git root's own origin remote, else a refusal.
+#   fm_proplane_promote_pr_repo_from_url <url>
+#     OWNER/NAME out of a github.com remote URL, or nothing when it cannot be
+#     read with confidence.
 set -u
 
 # Commit lines carried in the PR body. A promotion that merges a long-running
@@ -105,6 +118,54 @@ fm_proplane_promote_pr_bounded() {
 
 fm_proplane_promote_pr_gh() {
   fm_proplane_promote_pr_bounded gh-axi "$@"
+}
+
+# OWNER/NAME parsed out of a git remote URL, in either the https or the ssh form,
+# with any .git suffix and trailing slash removed. Prints nothing when the URL is
+# not a GitHub remote this can read with confidence: a half-parsed destination is
+# worse than none, because the caller would publish somewhere on a guess.
+fm_proplane_promote_pr_repo_from_url() {
+  local url=${1:-} path
+  case "$url" in
+    https://github.com/*) path=${url#https://github.com/} ;;
+    http://github.com/*) path=${url#http://github.com/} ;;
+    ssh://git@github.com/*) path=${url#ssh://git@github.com/} ;;
+    git@github.com:*) path=${url#git@github.com:} ;;
+    *) return 1 ;;
+  esac
+  path=${path%/}
+  path=${path%.git}
+  case "$path" in
+    ''|*/*/*) return 1 ;;
+    */*) printf '%s\n' "$path" ;;
+    *) return 1 ;;
+  esac
+}
+
+# The repository this promotion record is published to, as OWNER/NAME, resolved
+# from the ladder's own configuration and never from ambient tooling defaults.
+#
+# This exists because a GitHub call with no repository resolves a fork to its
+# PARENT, so a record built from a private fork's work is published to a project
+# the operator does not own. That is not hypothetical: it happened on 2026-08-02.
+# Order is the ladder's explicit GITHUB_REPO row, then the configured git root's
+# own origin remote, then refusal. Refusing is the correct end of that list: an
+# unrecorded promotion is recoverable, a promotion published to someone else's
+# repository is not.
+fm_proplane_promote_pr_repo() {
+  local git_root=$1 repo url
+  if repo=$(fm_proplane_agent_github_repo 2>/dev/null) && [ -n "$repo" ]; then
+    printf '%s\n' "$repo"
+    return 0
+  fi
+  url=$(git -C "$git_root" remote get-url origin 2>/dev/null) || url=""
+  if [ -n "$url" ] && repo=$(fm_proplane_promote_pr_repo_from_url "$url"); then
+    printf '%s\n' "$repo"
+    return 0
+  fi
+  echo "proplane-promote-pr: cannot determine which GitHub repository to publish the promotion record to" >&2
+  echo "proplane-promote-pr: set a GITHUB_REPO <owner>/<name> row in the ladder config, or give $git_root a github.com origin; refusing rather than letting the tool choose one" >&2
+  return 1
 }
 
 # Refresh the PR's head branch from origin. The reconciliation describes the diff
@@ -395,14 +456,19 @@ fm_proplane_promote_pr_number_from_url() {
 
 fm_proplane_promote_pr_sync() {
   local git_root=$1 base=$2 head=$3 title=$4 body_file=$5 dry_run=${6:-0}
-  local listing number out url
+  local listing number out url repo
 
   FM_PROPLANE_PROMOTE_PR_OPENED=0
   FM_PROPLANE_PROMOTE_PR_NUMBER=''
   FM_PROPLANE_PROMOTE_PR_URL=''
 
+  # Resolved before the dry-run branch so a dry run states the destination it
+  # would publish to, and refuses on the same terms the real path does. A preview
+  # that silently omits where the record goes is the one fact worth previewing.
+  repo=$(fm_proplane_promote_pr_repo "$git_root") || return 1
+
   if [ "$dry_run" = 1 ]; then
-    echo "DRY gh-axi pr create --base $base --head $head --title \"$title\" --body-file <generated>"
+    echo "DRY gh-axi pr create --repo $repo --base $base --head $head --title \"$title\" --body-file <generated>"
     echo "--- PR body (dry run, not opened) ---"
     cat "$body_file"
     echo "--- end PR body ---"
@@ -414,11 +480,16 @@ fm_proplane_promote_pr_sync() {
     return 1
   }
 
+  # Every call below names --repo. Without it the destination comes from whatever
+  # the working directory resolves to, and for a fork that is the PARENT project,
+  # which is how a private fork's promotion record was published to an upstream
+  # repository on 2026-08-02. The working directory must never decide this.
+  #
   # An open PR for the same head -> base pair IS the record for this promotion,
   # so a re-run updates it instead of stacking a duplicate. Once the ladder
   # fast-forwards main the PR closes as merged, so the next promotion of a new
   # range correctly finds nothing open and creates its own record.
-  listing=$(cd "$git_root" && fm_proplane_promote_pr_gh pr list --state open --base "$base" --head "$head" --limit "$FM_PROPLANE_PR_LIST_LIMIT" 2>&1) || {
+  listing=$(fm_proplane_promote_pr_gh pr list --repo "$repo" --state open --base "$base" --head "$head" --limit "$FM_PROPLANE_PR_LIST_LIMIT" 2>&1) || {
     echo "proplane-promote-pr: could not list open PRs for $head -> $base" >&2
     printf '%s\n' "$listing" >&2
     return 1
@@ -443,7 +514,7 @@ fm_proplane_promote_pr_sync() {
   fi
 
   if [ -n "$number" ]; then
-    out=$(cd "$git_root" && fm_proplane_promote_pr_gh pr edit "$number" --title "$title" --body-file "$body_file" 2>&1) || {
+    out=$(fm_proplane_promote_pr_gh pr edit "$number" --repo "$repo" --title "$title" --body-file "$body_file" 2>&1) || {
       echo "proplane-promote-pr: could not update promotion record PR #$number" >&2
       printf '%s\n' "$out" >&2
       return 1
@@ -453,7 +524,7 @@ fm_proplane_promote_pr_sync() {
     FM_PROPLANE_PROMOTE_PR_NUMBER=$number
     echo "proplane-promote-pr: updated promotion record PR #$number"
   else
-    out=$(cd "$git_root" && fm_proplane_promote_pr_gh pr create --base "$base" --head "$head" \
+    out=$(fm_proplane_promote_pr_gh pr create --repo "$repo" --base "$base" --head "$head" \
       --title "$title" --body-file "$body_file" 2>&1) || {
       echo "proplane-promote-pr: could not open promotion record PR" >&2
       printf '%s\n' "$out" >&2
@@ -480,15 +551,19 @@ fm_proplane_promote_pr_sync() {
 # not happen. Returns non-zero for the caller to warn on: an annotation that
 # cannot be posted must never change the outcome of the promotion that failed.
 fm_proplane_promote_pr_comment() {
-  local git_root=$1 number=$2 message=$3 dry_run=${4:-0} out
+  local git_root=$1 number=$2 message=$3 dry_run=${4:-0} out repo
 
   [ -n "$number" ] || {
     echo "proplane-promote-pr: no promotion record number to annotate" >&2
     return 1
   }
 
+  # Annotating is publishing too, so it names its repository on the same terms
+  # the record did and refuses on the same terms when it cannot be resolved.
+  repo=$(fm_proplane_promote_pr_repo "$git_root") || return 1
+
   if [ "$dry_run" = 1 ]; then
-    echo "DRY gh-axi pr comment $number --body \"$message\""
+    echo "DRY gh-axi pr comment $number --repo $repo --body \"$message\""
     return 0
   fi
 
@@ -497,7 +572,7 @@ fm_proplane_promote_pr_comment() {
     return 1
   }
 
-  out=$(cd "$git_root" && fm_proplane_promote_pr_gh pr comment "$number" --body "$message" 2>&1) || {
+  out=$(fm_proplane_promote_pr_gh pr comment "$number" --repo "$repo" --body "$message" 2>&1) || {
     echo "proplane-promote-pr: could not annotate promotion record PR #$number" >&2
     printf '%s\n' "$out" >&2
     return 1

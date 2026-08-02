@@ -32,9 +32,21 @@ set -u
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 fm_git_identity fmtest fmtest@example.invalid
 
+FM_TEST_PROMOTE_REPO=PrakritR/PropLane
 PR_LIB="$ROOT/bin/fm-proplane-promote-pr-lib.sh"
 PROMOTE_MAIN="$ROOT/bin/fm-proplane-promote-prakrit-to-main.sh"
 TMP_ROOT=$(fm_test_tmproot fm-proplane-promote-pr-tests)
+
+# The destination every unit-level publish resolves through. The end-to-end cases
+# build their own per-case ladder config; these smaller cases share this one so a
+# publish is never left inferring a repository from the fixture clone.
+# mkdir first: fm_test_tmproot runs in a command substitution, so the cleanup
+# trap it installs fires in that subshell and removes the root before it is ever
+# used. Every case here creates its own directory with mkdir -p for the same
+# reason; a write straight to the root would land nowhere.
+UNIT_LADDER_CONFIG="$TMP_ROOT/unit-proplane-agent-branches"
+mkdir -p "$TMP_ROOT"
+printf 'GITHUB_REPO\t%s\n' "$FM_TEST_PROMOTE_REPO" > "$UNIT_LADDER_CONFIG"
 
 # shellcheck source=bin/fm-proplane-promote-pr-lib.sh
 . "$PR_LIB"
@@ -472,13 +484,14 @@ make_gh_axi "$case_b/fakebin" none
 printf 'body\n' > "$case_b/body.md"
 export FM_TEST_GH_AXI_LOG="$case_b/gh.log"
 : > "$FM_TEST_GH_AXI_LOG"
-out=$(PATH="$case_b/fakebin:$PATH" bash -c '
+out=$(PATH="$case_b/fakebin:$PATH" FM_PROPLANE_AGENT_CONFIG="$UNIT_LADDER_CONFIG" bash -c '
+  . "$(dirname "$1")/fm-proplane-agent-branches-lib.sh"
   . "$1"
   fm_proplane_promote_pr_sync "$2" main prakrit "promote(ladder): prakrit -> main (aaa..bbb)" "$3" 0
 ' _ "$PR_LIB" "$case_b/repo" "$case_b/body.md" 2>&1) || fail "sync should succeed: $out"
 log=$(cat "$FM_TEST_GH_AXI_LOG")
-assert_contains "$log" 'pr list --state open --base main --head prakrit' 'looks for an existing PR first'
-assert_contains "$log" 'pr create --base main --head prakrit' 'creates the PR for prakrit into main'
+assert_contains "$log" 'pr list --repo PrakritR/PropLane --state open --base main --head prakrit' 'looks for an existing PR first'
+assert_contains "$log" 'pr create --repo PrakritR/PropLane --base main --head prakrit' 'creates the PR for prakrit into main'
 assert_contains "$log" "--body-file $case_b/body.md" 'creates the PR with the generated body'
 assert_not_contains "$log" 'pr edit' 'does not edit when no PR is open'
 assert_contains "$out" 'https://github.com/PrakritR/PropLane/pull/91' 'reports the full PR URL'
@@ -493,12 +506,13 @@ make_gh_axi "$case_c/fakebin" existing
 printf 'body\n' > "$case_c/body.md"
 export FM_TEST_GH_AXI_LOG="$case_c/gh.log"
 : > "$FM_TEST_GH_AXI_LOG"
-out=$(PATH="$case_c/fakebin:$PATH" bash -c '
+out=$(PATH="$case_c/fakebin:$PATH" FM_PROPLANE_AGENT_CONFIG="$UNIT_LADDER_CONFIG" bash -c '
+  . "$(dirname "$1")/fm-proplane-agent-branches-lib.sh"
   . "$1"
   fm_proplane_promote_pr_sync "$2" main prakrit "promote(ladder): prakrit -> main (ccc..ddd)" "$3" 0
 ' _ "$PR_LIB" "$case_c/repo" "$case_c/body.md" 2>&1) || fail "sync should succeed: $out"
 log=$(cat "$FM_TEST_GH_AXI_LOG")
-assert_contains "$log" 'pr edit 77 --title' 'updates the open promotion record'
+assert_contains "$log" 'pr edit 77 --repo PrakritR/PropLane --title' 'updates the open promotion record'
 assert_contains "$log" "--body-file $case_c/body.md" 'refreshes the body of the open record'
 assert_not_contains "$log" 'pr create' 'never opens a duplicate promotion record'
 assert_contains "$out" '#77' 'names the reused PR'
@@ -515,7 +529,8 @@ for mode in create-fails list-fails; do
   export FM_TEST_GH_AXI_LOG="$case_d/gh.log"
   : > "$FM_TEST_GH_AXI_LOG"
   set +e
-  out=$(PATH="$case_d/fakebin:$PATH" bash -c '
+  out=$(PATH="$case_d/fakebin:$PATH" FM_PROPLANE_AGENT_CONFIG="$UNIT_LADDER_CONFIG" bash -c '
+    . "$(dirname "$1")/fm-proplane-agent-branches-lib.sh"
     . "$1"
     fm_proplane_promote_pr_sync "$2" main prakrit "t" "$3" 0
   ' _ "$PR_LIB" "$case_d/repo" "$case_d/body.md" 2>&1)
@@ -534,7 +549,8 @@ printf 'body\n' > "$case_d_missing/body.md"
 # A PATH with the system tools but no gh-axi (the real one lives elsewhere, e.g.
 # /opt/homebrew/bin), so the absent-tool branch is the one under test.
 set +e
-out=$(PATH="$case_d_missing/emptybin:/usr/bin:/bin" /bin/bash -c '
+out=$(PATH="$case_d_missing/emptybin:/usr/bin:/bin" FM_PROPLANE_AGENT_CONFIG="$UNIT_LADDER_CONFIG" /bin/bash -c '
+  . "$(dirname "$1")/fm-proplane-agent-branches-lib.sh"
   . "$1"
   fm_proplane_promote_pr_sync "$2" main prakrit "t" "$3" 0
 ' _ "$PR_LIB" "$case_d_missing/repo" "$case_d_missing/body.md" 2>&1)
@@ -553,11 +569,12 @@ make_gh_axi "$case_e/fakebin" none
 printf 'BODY-MARKER\n' > "$case_e/body.md"
 export FM_TEST_GH_AXI_LOG="$case_e/gh.log"
 : > "$FM_TEST_GH_AXI_LOG"
-out=$(PATH="$case_e/fakebin:$PATH" bash -c '
+out=$(PATH="$case_e/fakebin:$PATH" FM_PROPLANE_AGENT_CONFIG="$UNIT_LADDER_CONFIG" bash -c '
+  . "$(dirname "$1")/fm-proplane-agent-branches-lib.sh"
   . "$1"
   fm_proplane_promote_pr_sync "$2" main prakrit "promote(ladder): prakrit -> main (eee..fff)" "$3" 1
 ' _ "$PR_LIB" "$case_e/repo" "$case_e/body.md" 2>&1) || fail "dry run should succeed: $out"
-assert_contains "$out" 'DRY gh-axi pr create --base main --head prakrit' 'dry run prints the PR it would open'
+assert_contains "$out" 'DRY gh-axi pr create --repo PrakritR/PropLane --base main --head prakrit' 'dry run prints the PR it would open'
 assert_contains "$out" 'BODY-MARKER' 'dry run prints the PR body'
 [ ! -s "$FM_TEST_GH_AXI_LOG" ] || fail 'dry run must not call gh-axi'
 pass 'dry run prints the promotion PR and opens none'
@@ -590,7 +607,8 @@ make_timeout "$case_k/fakebin" pass
 printf 'body\n' > "$case_k/body.md"
 export FM_TEST_GH_AXI_LOG="$case_k/gh.log"
 : > "$FM_TEST_GH_AXI_LOG"
-out=$(PATH="$case_k/fakebin:$PATH" FM_PROPLANE_PR_GH_TIMEOUT=17 bash -c '
+out=$(PATH="$case_k/fakebin:$PATH" FM_PROPLANE_AGENT_CONFIG="$UNIT_LADDER_CONFIG" FM_PROPLANE_PR_GH_TIMEOUT=17 bash -c '
+  . "$(dirname "$1")/fm-proplane-agent-branches-lib.sh"
   . "$1"
   fm_proplane_promote_pr_sync "$2" main prakrit "promote(ladder): prakrit -> main (kkk..lll)" "$3" 0
 ' _ "$PR_LIB" "$case_k/repo" "$case_k/body.md" 2>&1) || fail "bounded sync should succeed: $out"
@@ -598,7 +616,7 @@ log=$(cat "$FM_TEST_GH_AXI_LOG")
 assert_contains "$log" 'timeout-wrapper:17' 'the GitHub call runs under the configured bound'
 [ "$(grep -c '^timeout-wrapper:' "$FM_TEST_GH_AXI_LOG")" = 2 ] ||
   fail 'both the list and the create call must be bounded'
-assert_contains "$log" 'pr create --base main --head prakrit' 'the bounded call still opens the record'
+assert_contains "$log" 'pr create --repo PrakritR/PropLane --base main --head prakrit' 'the bounded call still opens the record'
 pass 'every GitHub call in the promotion record path is bounded'
 
 # A bound that fires is a failure like any other: reported, never fatal here.
@@ -611,7 +629,8 @@ printf 'body\n' > "$case_k2/body.md"
 export FM_TEST_GH_AXI_LOG="$case_k2/gh.log"
 : > "$FM_TEST_GH_AXI_LOG"
 set +e
-out=$(PATH="$case_k2/fakebin:$PATH" bash -c '
+out=$(PATH="$case_k2/fakebin:$PATH" FM_PROPLANE_AGENT_CONFIG="$UNIT_LADDER_CONFIG" bash -c '
+  . "$(dirname "$1")/fm-proplane-agent-branches-lib.sh"
   . "$1"
   fm_proplane_promote_pr_sync "$2" main prakrit "t" "$3" 0
 ' _ "$PR_LIB" "$case_k2/repo" "$case_k2/body.md" 2>&1)
@@ -634,13 +653,14 @@ make_gh_axi "$case_l/fakebin" foreign
 printf 'body\n' > "$case_l/body.md"
 export FM_TEST_GH_AXI_LOG="$case_l/gh.log"
 : > "$FM_TEST_GH_AXI_LOG"
-out=$(PATH="$case_l/fakebin:$PATH" bash -c '
+out=$(PATH="$case_l/fakebin:$PATH" FM_PROPLANE_AGENT_CONFIG="$UNIT_LADDER_CONFIG" bash -c '
+  . "$(dirname "$1")/fm-proplane-agent-branches-lib.sh"
   . "$1"
   fm_proplane_promote_pr_sync "$2" main prakrit "promote(ladder): prakrit -> main (lll..mmm)" "$3" 0
 ' _ "$PR_LIB" "$case_l/repo" "$case_l/body.md" 2>&1) || fail "sync should succeed: $out"
 log=$(cat "$FM_TEST_GH_AXI_LOG")
 assert_not_contains "$log" 'pr edit' 'a PR that is not a promotion record is never rewritten'
-assert_contains "$log" 'pr create --base main --head prakrit' 'a fresh record is opened instead'
+assert_contains "$log" 'pr create --repo PrakritR/PropLane --base main --head prakrit' 'a fresh record is opened instead'
 assert_contains "$out" 'rather than rewriting an unrelated PR' 'the skipped reuse is explained'
 pass 'reuse is refused for an open PR that is not a promotion record'
 
@@ -654,12 +674,13 @@ make_gh_axi "$case_l2/fakebin" buried
 printf 'body\n' > "$case_l2/body.md"
 export FM_TEST_GH_AXI_LOG="$case_l2/gh.log"
 : > "$FM_TEST_GH_AXI_LOG"
-out=$(PATH="$case_l2/fakebin:$PATH" bash -c '
+out=$(PATH="$case_l2/fakebin:$PATH" FM_PROPLANE_AGENT_CONFIG="$UNIT_LADDER_CONFIG" bash -c '
+  . "$(dirname "$1")/fm-proplane-agent-branches-lib.sh"
   . "$1"
   fm_proplane_promote_pr_sync "$2" main prakrit "promote(ladder): prakrit -> main (nnn..ooo)" "$3" 0
 ' _ "$PR_LIB" "$case_l2/repo" "$case_l2/body.md" 2>&1) || fail "sync should succeed: $out"
 log=$(cat "$FM_TEST_GH_AXI_LOG")
-assert_contains "$log" 'pr edit 77 --title' 'the record is found behind an unrelated open PR'
+assert_contains "$log" 'pr edit 77 --repo PrakritR/PropLane --title' 'the record is found behind an unrelated open PR'
 assert_not_contains "$log" 'pr create' 'a found record is never duplicated'
 assert_not_contains "$out" 'rather than rewriting an unrelated PR' 'a found record is not reported as missing'
 pass 'the reuse scan reads past the first row to find the promotion record'
@@ -680,6 +701,11 @@ make_promotion_case() {
   mkdir -p "$case_dir/home/config" "$case_dir/fakebin"
   make_repo "$case_dir/repo"
   printf 'GIT_ROOT\t%s\n' "$case_dir/repo" > "$case_dir/home/config/proplane-agent-branches"
+  # The destination is declared, never inferred. Fixture clones have file://
+  # origins, and the real ladder root is a fork whose parent is a different
+  # project, so a record that resolves its own repository from the working
+  # directory is exactly the bug these fixtures must not model as normal.
+  printf 'GITHUB_REPO\t%s\n' "$FM_TEST_PROMOTE_REPO" >> "$case_dir/home/config/proplane-agent-branches"
   printf 'cursor-2\t%s\t3011\n' "$case_dir/sandbox" >> "$case_dir/home/config/proplane-agent-branches"
   [ -n "$prakrit_worktree" ] &&
     printf 'prakrit\t%s\t3000\n' "$prakrit_worktree" >> "$case_dir/home/config/proplane-agent-branches"
@@ -717,7 +743,7 @@ rc=$?
 set -e
 expect_code 0 "$rc" 'promotion with the record PR should succeed'
 log=$(cat "$case_f/gh.log")
-assert_contains "$log" 'pr create --base main --head prakrit' 'the promotion opens the record PR'
+assert_contains "$log" 'pr create --repo PrakritR/PropLane --base main --head prakrit' 'the promotion opens the record PR'
 assert_contains "$out" 'promotion record PR' 'the promotion announces the record'
 assert_contains "$out" 'SKIPPED' 'skipped gates are announced'
 [ "$(origin_sha "$case_f" main)" = "$prakrit_sha" ] || fail 'origin/main should be fast-forwarded to prakrit'
@@ -805,7 +831,7 @@ rc=$?
 set -e
 expect_code 1 "$rc" 'a failed fast-forward must still fail the promotion'
 log=$(cat "$case_m/gh.log")
-assert_contains "$log" 'pr create --base main --head prakrit' 'the record was opened before the push failed'
+assert_contains "$log" 'pr create --repo PrakritR/PropLane --base main --head prakrit' 'the record was opened before the push failed'
 assert_contains "$log" 'pr comment 91' 'the opened record is annotated when the push does not land'
 assert_contains "$log" 'did NOT complete' 'the annotation says the fast-forward did not complete'
 [ "$(origin_sha "$case_m" main)" = "$main_sha_before" ] || fail 'a rejected push must not move origin/main'
@@ -855,7 +881,7 @@ rc=$?
 set -e
 expect_code 1 "$rc" 'a failed post-push sync should still fail the promotion'
 log=$(cat "$case_p/gh.log")
-assert_contains "$log" 'pr create --base main --head prakrit' 'the record was opened'
+assert_contains "$log" 'pr create --repo PrakritR/PropLane --base main --head prakrit' 'the record was opened'
 assert_contains "$out" 'pushed origin/main' 'the promotion did land main'
 [ "$(origin_sha "$case_p" main)" = "$prakrit_sha" ] || fail 'origin/main must have been fast-forwarded'
 assert_not_contains "$log" 'pr comment' 'a record for a landed promotion is never annotated as failed'
@@ -872,7 +898,7 @@ out=$(run_promotion "$case_h" --dry-run --validate-only --push-main --skip-gates
 rc=$?
 set -e
 expect_code 0 "$rc" 'dry run should succeed'
-assert_contains "$out" 'DRY gh-axi pr create --base main --head prakrit' 'dry run prints the PR it would open'
+assert_contains "$out" 'DRY gh-axi pr create --repo PrakritR/PropLane --base main --head prakrit' 'dry run prints the PR it would open'
 # The recorded range is the integrate branch this promotion was built on, never a
 # fresh read of prakrit, which may have moved since.
 assert_contains "$out" 'origin/main..integrate/prakrit-to-main' 'dry run prints the promoted range'
@@ -898,7 +924,7 @@ expect_code 0 "$rc" 'a plain dry run should succeed'
 assert_contains "$out" 'fm-proplane-security-review.sh' 'the dry run names the review it would run'
 assert_not_contains "$out" 'proplane-security-review:' 'the dry run must not run the real security review'
 assert_absent "$case_t/home/state" 'a dry run must not write a security review report'
-assert_contains "$out" 'DRY gh-axi pr create --base main --head prakrit' 'the dry run previews the record PR'
+assert_contains "$out" 'DRY gh-axi pr create --repo PrakritR/PropLane --base main --head prakrit' 'the dry run previews the record PR'
 assert_contains "$out" 'origin/main..integrate/prakrit-to-main' 'the dry run prints the promoted range'
 assert_contains "$out" 'NOT RUN' 'the previewed record says the gates did not run'
 [ ! -s "$case_t/gh.log" ] || fail 'a plain dry run must not call gh-axi'
@@ -945,7 +971,7 @@ out=$(run_promotion "$case_t2" --dry-run)
 rc=$?
 set -e
 expect_code 0 "$rc" 'a dry run with no integrate branch should succeed'
-assert_contains "$out" 'DRY gh-axi pr create --base main --head prakrit' 'it still previews the record PR'
+assert_contains "$out" 'DRY gh-axi pr create --repo PrakritR/PropLane --base main --head prakrit' 'it still previews the record PR'
 assert_contains "$out" 'origin/main..origin/prakrit' 'it previews the range a real promotion would carry'
 [ ! -s "$case_t2/gh.log" ] || fail 'a dry run must not call gh-axi'
 pass 'a dry run with no integrate branch previews cleanly instead of dying on a missing ref'
@@ -977,7 +1003,7 @@ out=$(FM_HOME="$case_j/home" PATH="$case_j/fakebin:$PATH" FM_TEST_GH_AXI_LOG="$c
 rc=$?
 set -e
 expect_code 0 "$rc" 'the full ladder dry run should succeed'
-assert_contains "$out" 'DRY gh-axi pr create --base main --head prakrit' 'the ladder dry run previews the record PR'
+assert_contains "$out" 'DRY gh-axi pr create --repo PrakritR/PropLane --base main --head prakrit' 'the ladder dry run previews the record PR'
 assert_contains "$out" 'origin/main..origin/prakrit' 'the ladder dry run shows the range'
 [ ! -s "$case_j/gh.log" ] || fail 'the ladder dry run must not call gh-axi'
 [ "$(origin_sha "$case_j" main)" = "$main_sha_before" ] || fail 'the ladder dry run must not move origin/main'
@@ -1074,5 +1100,104 @@ assert_grep 'promotion-record PR' "$LADDER_SKILL" 'the ladder skill states the p
 assert_grep 'fm-proplane-promote-pr-lib.sh' "$LADDER_SKILL" 'the ladder skill names the contract owner'
 assert_grep 'promotion record PR' "$PROMOTE_SKILL" 'the promote skill states the promotion PR'
 pass 'the ladder and promote instructions match the promotion PR the tooling opens'
+
+# --- (z) the record's destination is chosen by the ladder, never by cwd --------
+#
+# Regression for 2026-08-02: a PR opened with no repository named resolved the
+# fork to its PARENT and published the captain's fork-only work to an upstream
+# project. Nothing below may let the working directory decide where a record goes.
+
+case_dest="$TMP_ROOT/destination"
+mkdir -p "$case_dest/home/config"
+make_repo "$case_dest/repo"
+make_gh_axi "$case_dest/fakebin" none
+printf 'body\n' > "$case_dest/body.md"
+
+# A github.com origin resolves to that repository, in either URL form, and a
+# fork resolves to the FORK: the parent is never consulted.
+[ "$(fm_proplane_promote_pr_repo_from_url 'https://github.com/PrakritR/firstmate.git')" = 'PrakritR/firstmate' ] ||
+  fail 'https remote should resolve to its own owner/name'
+[ "$(fm_proplane_promote_pr_repo_from_url 'git@github.com:PrakritR/firstmate.git')" = 'PrakritR/firstmate' ] ||
+  fail 'ssh remote should resolve to its own owner/name'
+[ "$(fm_proplane_promote_pr_repo_from_url 'https://github.com/PrakritR/firstmate/')" = 'PrakritR/firstmate' ] ||
+  fail 'trailing slash should not defeat resolution'
+fm_proplane_promote_pr_repo_from_url 'file:///tmp/somewhere.git' >/dev/null 2>&1 &&
+  fail 'a non-github remote must not resolve to a repository'
+fm_proplane_promote_pr_repo_from_url 'https://github.com/onlyowner' >/dev/null 2>&1 &&
+  fail 'an owner with no repository name must not resolve'
+pass 'a repository is read only from a remote that actually names one'
+
+# The configured destination wins over anything the clone would imply.
+git -C "$case_dest/repo" remote set-url origin https://github.com/SomeoneElse/wrong.git
+printf 'GIT_ROOT\t%s\n' "$case_dest/repo" > "$case_dest/home/config/proplane-agent-branches"
+printf 'GITHUB_REPO\t%s\n' 'PrakritR/PropLane' >> "$case_dest/home/config/proplane-agent-branches"
+FM_PROPLANE_AGENT_CONFIG="$case_dest/home/config/proplane-agent-branches"
+export FM_PROPLANE_AGENT_CONFIG
+# shellcheck source=bin/fm-proplane-agent-branches-lib.sh
+. "$ROOT/bin/fm-proplane-agent-branches-lib.sh"
+[ "$(fm_proplane_promote_pr_repo "$case_dest/repo")" = 'PrakritR/PropLane' ] ||
+  fail 'the configured GITHUB_REPO must win'
+pass 'the ladder config decides the destination when it declares one'
+
+# With no declared destination it falls back to the git root's OWN origin, which
+# is still explicit: it is that clone's remote, not a parent the tool inferred.
+printf 'GIT_ROOT\t%s\n' "$case_dest/repo" > "$case_dest/home/config/proplane-agent-branches"
+[ "$(fm_proplane_promote_pr_repo "$case_dest/repo")" = 'SomeoneElse/wrong' ] ||
+  fail 'without a config row the git root origin decides'
+pass 'the destination falls back to the git root own origin, never to a parent'
+
+# Neither available: refuse loudly and make no call at all.
+git -C "$case_dest/repo" remote set-url origin "file://$case_dest/repo.origin"
+set +e
+out=$(fm_proplane_promote_pr_repo "$case_dest/repo" 2>&1)
+rc=$?
+set -e
+expect_code 1 "$rc" 'an unresolvable destination must refuse'
+assert_contains "$out" 'refusing rather than letting the tool choose one' 'the refusal says why'
+assert_contains "$out" 'GITHUB_REPO' 'the refusal names how to fix it'
+
+export FM_TEST_GH_AXI_LOG="$case_dest/gh.log"
+: > "$FM_TEST_GH_AXI_LOG"
+set +e
+out=$(PATH="$case_dest/fakebin:$PATH" fm_proplane_promote_pr_sync "$case_dest/repo" main prakrit 't' "$case_dest/body.md" 0 2>&1)
+rc=$?
+set -e
+expect_code 1 "$rc" 'publishing must refuse when the destination is unknown'
+[ ! -s "$FM_TEST_GH_AXI_LOG" ] || fail 'an unresolvable destination must make no GitHub call'
+pass 'an unresolvable destination refuses instead of publishing somewhere inferred'
+
+# Every publishing call names the repository explicitly.
+printf 'GITHUB_REPO\t%s\n' 'PrakritR/PropLane' >> "$case_dest/home/config/proplane-agent-branches"
+: > "$FM_TEST_GH_AXI_LOG"
+PATH="$case_dest/fakebin:$PATH" fm_proplane_promote_pr_sync "$case_dest/repo" main prakrit \
+  "$FM_PROPLANE_PR_TITLE_PREFIX (aaa..bbb)" "$case_dest/body.md" 0 >/dev/null 2>&1 ||
+  fail 'sync should succeed with a declared destination'
+log=$(cat "$FM_TEST_GH_AXI_LOG")
+assert_contains "$log" 'pr list --repo PrakritR/PropLane' 'the listing names its repository'
+assert_contains "$log" 'pr create --repo PrakritR/PropLane' 'the create names its repository'
+while IFS= read -r call; do
+  case "$call" in
+    pr\ *) assert_contains "$call" '--repo PrakritR/PropLane' 'every pr call must name its repository' ;;
+  esac
+done < "$FM_TEST_GH_AXI_LOG"
+pass 'every GitHub call names the repository the ladder chose'
+
+# The annotation path is a publishing call too, so it carries the destination.
+: > "$FM_TEST_GH_AXI_LOG"
+PATH="$case_dest/fakebin:$PATH" fm_proplane_promote_pr_comment "$case_dest/repo" 91 'note' 0 >/dev/null 2>&1 ||
+  fail 'comment should succeed with a declared destination'
+assert_grep 'pr comment 91 --repo PrakritR/PropLane' "$FM_TEST_GH_AXI_LOG" \
+  'the annotation names its repository'
+pass 'annotating a record also names the repository the ladder chose'
+
+# A dry run states where it would publish, and still calls nothing.
+: > "$FM_TEST_GH_AXI_LOG"
+out=$(PATH="$case_dest/fakebin:$PATH" fm_proplane_promote_pr_sync "$case_dest/repo" main prakrit 't' "$case_dest/body.md" 1 2>&1) ||
+  fail 'dry run should succeed'
+assert_contains "$out" '--repo PrakritR/PropLane' 'a dry run names the destination it would publish to'
+[ ! -s "$FM_TEST_GH_AXI_LOG" ] || fail 'a dry run must still make no GitHub call'
+pass 'a dry run states the destination without publishing to it'
+
+unset FM_PROPLANE_AGENT_CONFIG
 
 pass 'fm-proplane-promote-pr: all cases'
