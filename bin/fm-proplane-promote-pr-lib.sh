@@ -120,6 +120,35 @@ FM_PROPLANE_PROMOTE_PR_OPENED=0
 FM_PROPLANE_PROMOTE_PR_NUMBER=''
 FM_PROPLANE_PROMOTE_PR_URL=''
 
+# The process group a watchdog call is currently detached into, or empty when no
+# call is in flight. It is what the signal handlers below have to work from: a
+# trap runs with no access to the arguments of the call it is cleaning up after.
+FM_PROPLANE_PR_WATCHDOG_PGID=''
+
+# Take down the detached group, if one is still in flight. Idempotent, because
+# the same handler serves the expiry path, INT, TERM, and EXIT, and a second
+# pass must never kill a group some later call has since been given.
+fm_proplane_promote_pr_watchdog_reap() {
+  local pgid=${FM_PROPLANE_PR_WATCHDOG_PGID:-}
+  FM_PROPLANE_PR_WATCHDOG_PGID=''
+  [ -n "$pgid" ] || return 0
+  kill -TERM "-$pgid" 2>/dev/null || kill -TERM "$pgid" 2>/dev/null
+  sleep 1
+  kill -KILL "-$pgid" 2>/dev/null || kill -KILL "$pgid" 2>/dev/null
+  return 0
+}
+
+# Put back whatever the caller had trapped. Saved and restored rather than simply
+# cleared: bash has no function-local traps, so a watchdog that reset them would
+# quietly disarm a caller's own cleanup for every call after the first.
+fm_proplane_promote_pr_watchdog_restore_traps() {
+  trap - INT TERM EXIT
+  if [ -n "${1:-}" ]; then eval "$1"; fi
+  if [ -n "${2:-}" ]; then eval "$2"; fi
+  if [ -n "${3:-}" ]; then eval "$3"; fi
+  return 0
+}
+
 # Bound a call with no external tool at all: run it in its own process group,
 # poll for it, and kill that whole group when the bound expires. The group is
 # what makes this work — a hung `gh-axi` holds the caller's output pipe open
@@ -127,12 +156,23 @@ FM_PROPLANE_PROMOTE_PR_URL=''
 # command substitution reading a pipe nobody will ever close, which is the hang
 # this exists to prevent.
 #
+# That same detachment is why the handlers exist. A bare call shares the shell's
+# group and dies with it; a detached one does not, so an interrupted promotion
+# would leave an in-flight `gh-axi pr create` running to completion and publish a
+# record for a promotion that was abandoned before the fast-forward — with no
+# script left alive to annotate it. The promotion takes its detached call down
+# with it instead.
+#
 # Exits 124 on expiry, the same code the real `timeout` reports, so every caller
 # treats a bound that fired as the ordinary warn-and-continue failure it is.
 fm_proplane_promote_pr_watchdog() {
   local limit=$1
   shift
   local pid rc waited=0 monitor_was_on=0
+  local prev_int prev_term prev_exit
+  prev_int=$(trap -p INT)
+  prev_term=$(trap -p TERM)
+  prev_exit=$(trap -p EXIT)
   # Monitor mode is what puts the background job in its own process group. It is
   # restored afterwards so a caller that had job control on keeps it.
   case $- in *m*) monitor_was_on=1 ;; esac
@@ -140,6 +180,13 @@ fm_proplane_promote_pr_watchdog() {
   "$@" &
   pid=$!
   [ "$monitor_was_on" -eq 1 ] || set +m
+  FM_PROPLANE_PR_WATCHDOG_PGID=$pid
+  # A signal is reported as 128+signal rather than re-raised: this function
+  # usually runs inside a command substitution, where `$$` is still the PARENT
+  # shell, so re-raising would signal a promotion that was never interrupted.
+  trap 'fm_proplane_promote_pr_watchdog_reap; exit 130' INT
+  trap 'fm_proplane_promote_pr_watchdog_reap; exit 143' TERM
+  trap fm_proplane_promote_pr_watchdog_reap EXIT
   # Elapsed time is counted in whole polled seconds rather than read from
   # SECONDS: bash 3.2, which is the system bash this ladder runs under, drops
   # that variable's special meaning once a function makes it local, and a
@@ -150,10 +197,9 @@ fm_proplane_promote_pr_watchdog() {
     waited=$((waited + 1))
   done
   if kill -0 "$pid" 2>/dev/null; then
-    kill -TERM "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
-    sleep 1
-    kill -KILL "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null
+    fm_proplane_promote_pr_watchdog_reap
     wait "$pid" 2>/dev/null
+    fm_proplane_promote_pr_watchdog_restore_traps "$prev_int" "$prev_term" "$prev_exit"
     return 124
   fi
   if wait "$pid"; then
@@ -161,6 +207,10 @@ fm_proplane_promote_pr_watchdog() {
   else
     rc=$?
   fi
+  # Cleared before the traps come off, so a call that finished on its own can
+  # never have a handler reap a group that is no longer its own.
+  FM_PROPLANE_PR_WATCHDOG_PGID=''
+  fm_proplane_promote_pr_watchdog_restore_traps "$prev_int" "$prev_term" "$prev_exit"
   return "$rc"
 }
 

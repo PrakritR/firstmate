@@ -30,6 +30,7 @@
 #   (bb) a config reader that is not loaded refuses instead of falling back
 #   (cc) a declared destination that is not the push target is warned about
 #   (dd) reusing a record retires the annotation that would contradict it
+#   (ee) an interrupted promotion takes its detached bounded call down with it
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -738,6 +739,75 @@ out=$(PATH="$case_aa2/fakebin:$case_aa2/bin" FM_PROPLANE_AGENT_CONFIG="$UNIT_LAD
 assert_grep 'pr create --repo PrakritR/PropLane' "$FM_TEST_GH_AXI_LOG" 'the record is still opened'
 assert_contains "$out" 'https://github.com/PrakritR/PropLane/pull/91' 'the call output still reaches the caller'
 pass 'the shell-level bound passes a healthy call through untouched'
+
+# --- (ee) an interrupted promotion takes its detached call down with it --------
+#
+# The bound runs its payload in its own process group, which is what lets the
+# expiry kill reach a child holding the caller's pipe. That same detachment means
+# the payload no longer dies with the shell that started it: a promotion killed
+# while `gh-axi pr create` is in flight would leave that call to finish and
+# publish a record for a promotion that was abandoned before the fast-forward,
+# with no script left alive to annotate it.
+
+case_ee="$TMP_ROOT/ee"
+mkdir -p "$case_ee"
+# The payload records its own pid and a child's, so the assertion covers the
+# whole group rather than just the leader the shell knows about.
+cat > "$case_ee/payload" <<SH
+#!/usr/bin/env bash
+sleep 600 &
+printf '%s %s\n' "\$\$" "\$!" > "$case_ee/pids"
+wait
+SH
+chmod +x "$case_ee/payload"
+/bin/bash -c '
+  . "$1"
+  fm_proplane_promote_pr_watchdog 600 "$2"
+' _ "$PR_LIB" "$case_ee/payload" >/dev/null 2>&1 &
+watchdog_runner=$!
+waited=0
+while [ ! -s "$case_ee/pids" ] && [ "$waited" -lt 15 ]; do
+  sleep 1
+  waited=$((waited + 1))
+done
+[ -s "$case_ee/pids" ] || fail 'the watchdog payload never started, so the fixture proves nothing'
+read -r payload_leader payload_child < "$case_ee/pids"
+kill -0 "$payload_leader" 2>/dev/null || fail 'the fixture must have a live payload to orphan'
+
+kill -TERM "$watchdog_runner" 2>/dev/null || fail 'the watchdog runner must be alive to terminate'
+waited=0
+while { kill -0 "$payload_leader" 2>/dev/null || kill -0 "$payload_child" 2>/dev/null; } &&
+  [ "$waited" -lt 20 ]; do
+  sleep 1
+  waited=$((waited + 1))
+done
+# Best effort, so a failure here cannot leave a 10-minute sleep behind.
+kill -KILL "-$payload_leader" 2>/dev/null || true
+kill -KILL "$payload_child" 2>/dev/null || true
+kill -0 "$payload_leader" 2>/dev/null &&
+  fail 'a terminated promotion must not leave its detached GitHub call running'
+kill -0 "$payload_child" 2>/dev/null &&
+  fail 'a terminated promotion must not leave the children of its detached call running'
+wait "$watchdog_runner" 2>/dev/null || true
+pass 'a terminated promotion takes its detached bounded call down with it'
+
+# The handlers must not outlive the call they guard. Run in THIS shell, not a
+# subshell: bash has no function-local traps, so a bound that reset them would
+# disarm the caller's own cleanup — including this suite's temp-root removal —
+# and a subshell would hide that by discarding the damage on exit.
+trap 'printf "callers-own-exit-trap\n" >> "$case_ee/traps.log"' EXIT
+trap 'printf "callers-own-int-trap\n" >> "$case_ee/traps.log"' INT
+fm_proplane_promote_pr_watchdog 5 /bin/echo bounded-ok > "$case_ee/bounded.txt" ||
+  fail 'a healthy bounded call should succeed'
+[ "$(cat "$case_ee/bounded.txt")" = bounded-ok ] ||
+  fail "the bounded call output should reach the caller, got: $(cat "$case_ee/bounded.txt")"
+assert_contains "$(trap -p EXIT)" 'callers-own-exit-trap' 'the caller EXIT trap survives a bounded call'
+assert_contains "$(trap -p INT)" 'callers-own-int-trap' 'the caller INT trap survives a bounded call'
+[ -z "$FM_PROPLANE_PR_WATCHDOG_PGID" ] ||
+  fail 'a completed call must leave no process group for a later handler to reap'
+trap - EXIT INT
+trap fm_test_cleanup EXIT
+pass 'the bound restores the caller own traps and tracks nothing after it returns'
 
 # --- (l) an open PR that is not a promotion record is never rewritten ---------
 #
