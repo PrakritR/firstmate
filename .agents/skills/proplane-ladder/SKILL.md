@@ -36,8 +36,17 @@ Implement only in that worktree; never treat `projects/proplane-prakrit` as the 
 Also allowed on `origin`: `main` and `production` only besides the five agent/integration branches above.
 
 **Never push** `fm/*`, feature, or task branches to GitHub.
-**Never open a PR** unless the captain explicitly asks.
 Land commits on the owning keeper branch in that agent's worktree only.
+
+**Promotion PR (standing captain order, 2026-07-31):** every `prakrit` → `main` promotion opens a promotion-record PR from `prakrit` into `main`, carrying the promoted commit range, the security-review outcome, and the validation outcome.
+`bin/fm-proplane-promote-prakrit-to-main.sh --push-main` opens it, and `bin/fm-proplane-promote-pr-lib.sh` owns the contract.
+It is a record, not a second gate: the ladder fast-forwards `main` right after opening it, and a GitHub failure warns without stopping the promotion.
+The promotion is built on `integrate/prakrit-to-main`, which is never pushed to GitHub, so the PR is opened from `prakrit` and the body reconciles the two: the promoted range is authoritative, and any commit the PR's diff omits or shows without landing is named there.
+GitHub closes the PR as merged only when `prakrit` carries nothing the promotion left behind; when it does not close, the body says so and the next promotion's record replaces it.
+Open **no other** PR unless the captain explicitly asks.
+
+**Destination is declared, never inferred.** Every GitHub call the record makes names its repository explicitly, taken from an optional `GITHUB_REPO <owner>/<name>` row in `config/proplane-agent-branches`, else the configured `GIT_ROOT`'s own `origin`, else a refusal.
+A call that names no repository resolves a fork to its **parent**, which on 2026-08-02 published fork-only work to an upstream project, so declaring the row is preferred over relying on the clone's remote.
 
 ## After changes land
 
