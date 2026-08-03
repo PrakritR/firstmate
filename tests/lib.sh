@@ -59,11 +59,16 @@ pass() {
 
 FM_TEST_CLEANUP_DIRS=()
 
+# Removal only: cleanup never decides a test file's exit status. It runs from an
+# EXIT trap, so a non-zero return here - which is what the empty-list pass gives
+# on its `[ -n "$d" ]` - would exit a file that left errexit on as a failure
+# after every one of its cases passed.
 fm_test_cleanup() {
   local d
   for d in "${FM_TEST_CLEANUP_DIRS[@]:-}"; do
     [ -n "$d" ] && rm -rf "$d"
   done
+  return 0
 }
 
 fm_test_tmproot() {
