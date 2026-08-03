@@ -238,7 +238,10 @@ annotate_failed_fast_forward() {
     echo "proplane-promote-main: WARNING a promotion record PR was opened but its number could not be read, so it was not annotated; it still claims a promotion that did not land - annotate the open prakrit -> main PR by hand (${PROMOTION_PR_URL:-no URL reported})" >&2
     return 0
   fi
-  message="proplane-promote-main: the fast-forward of \`main\` did NOT complete after this record was opened, so this record does not reflect a landed promotion. Re-run the promote once the cause is resolved."
+  # The marker phrase comes from the PR library: a later promotion that reuses
+  # this same record looks for it there to retire this annotation, so the two
+  # must never drift into wording that no longer matches.
+  message="proplane-promote-main: $FM_PROPLANE_PR_FAILED_MARKER after this record was opened, so this record does not reflect a landed promotion. Re-run the promote once the cause is resolved."
   fm_proplane_promote_pr_comment "$GIT_ROOT" "$PROMOTION_PR_NUMBER" "$message" "$DRY_RUN" || {
     echo "proplane-promote-main: WARNING could not annotate promotion record PR #$PROMOTION_PR_NUMBER; it still claims a promotion that did not land" >&2
   }

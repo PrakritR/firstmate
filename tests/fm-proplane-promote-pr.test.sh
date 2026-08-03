@@ -26,6 +26,10 @@
 #   (w) a head branch that cannot be read is recorded as unavailable, not guessed
 #   (x) a divergence of merge commits alone is explained, not self-contradicted
 #   (y) a divergence and a merge-only difference at once still point at evidence
+#   (aa) the bound still holds with neither timeout nor gtimeout on PATH
+#   (bb) a config reader that is not loaded refuses instead of falling back
+#   (cc) a declared destination that is not the push target is warned about
+#   (dd) reusing a record retires the annotation that would contradict it
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -73,7 +77,10 @@ make_repo() {
 # foreign (one open PR #66 that is NOT a promotion record), buried (a foreign PR
 # listed ahead of the record, so only a listing wider than one row finds it),
 # create-fails (listing works, create does not), create-silent (create succeeds
-# but prints no URL), list-fails, comment-fails.
+# but prints no URL), list-fails, comment-fails, hangs (a listing that never
+# returns, via a child process, which is what a wedged network call looks like),
+# annotated (the open record carries an earlier "did not land" annotation),
+# annotated-superseded (that annotation has already been retired), view-fails.
 #
 # `pr list` honors --limit the way the real one does, so a test that needs a row
 # gh-axi would have truncated away cannot pass on a stub that ignores the cap.
@@ -91,13 +98,21 @@ fi
 case "\${1:-} \${2:-}" in
   "pr list")
     [ "\$mode" = list-fails ] && { echo "error: HTTP 401" >&2; exit 1; }
+    # A call that never returns, and whose output pipe is held open by a CHILD:
+    # a bound that kills only the process it started would leave this sleep
+    # holding the caller's pipe, so the caller hangs anyway.
+    if [ "\$mode" = hangs ]; then
+      sleep 600
+      exit 0
+    fi
     limit=1
     prev=
     for a in "\$@"; do
       [ "\$prev" = --limit ] && limit=\$a
       prev=\$a
     done
-    if [ "\$mode" = existing ]; then
+    if [ "\$mode" = existing ] || [ "\$mode" = annotated ] ||
+      [ "\$mode" = annotated-superseded ] || [ "\$mode" = view-fails ]; then
       echo 'count: 1 of 1 total'
       echo 'pull_requests[1]{number,title,state,author,draft,review}:'
       echo '  77,"promote(ladder): prakrit -> main (aaa..bbb)",open,prakrit,no,none'
@@ -116,6 +131,17 @@ case "\${1:-} \${2:-}" in
     else
       echo 'count: 0'
       echo 'pull_requests: []'
+    fi
+    exit 0
+    ;;
+  "pr view")
+    [ "\$mode" = view-fails ] && { echo "error: HTTP 502" >&2; exit 1; }
+    if [ "\$mode" = annotated ] || [ "\$mode" = annotated-superseded ]; then
+      echo 'comments[]:'
+      echo '  prakrit: proplane-promote-main: the fast-forward of \`main\` did NOT complete after this record was opened, so this record does not reflect a landed promotion.'
+    fi
+    if [ "\$mode" = annotated-superseded ]; then
+      echo '  prakrit: proplane-promote-pr: this record has been rewritten for a later promotion run. The earlier annotation above describes a promotion attempt that did not land.'
     fi
     exit 0
     ;;
@@ -641,6 +667,78 @@ assert_contains "$out" 'could not list open PRs' 'the timed-out call is named'
 assert_no_grep 'pr create' "$FM_TEST_GH_AXI_LOG" 'a timed-out listing must not fall through to a create'
 pass 'a timed-out GitHub call is reported as a failure the caller can warn on'
 
+# --- (aa) the bound holds with neither timeout nor gtimeout on PATH -----------
+#
+# The case above proves the wrapper is used when it exists. macOS ships neither
+# `timeout` nor `gtimeout`, so on the machine this ladder actually runs on the
+# fallback IS the bound, and a test that always shims a `timeout` onto PATH
+# proves nothing about it. These run with a PATH that has neither.
+
+# make_no_timeout_bin <dir>: a bin directory holding the tools these fixtures
+# need and, deliberately, no bounding binary at all. Symlinks rather than a
+# filtered PATH, because a host that has `timeout` in any standard directory
+# would otherwise put it back and silently retire this coverage.
+make_no_timeout_bin() {
+  local dir=$1 tool src
+  mkdir -p "$dir"
+  for tool in bash sh env git sleep awk sed grep cat head wc tr mktemp rm date dirname basename uname; do
+    src=$(command -v "$tool" 2>/dev/null) || continue
+    case "$src" in /*) ln -sf "$src" "$dir/$tool" ;; esac
+  done
+}
+
+case_aa="$TMP_ROOT/aa"
+mkdir -p "$case_aa"
+make_repo "$case_aa/repo"
+make_gh_axi "$case_aa/fakebin" hangs
+make_no_timeout_bin "$case_aa/bin"
+printf 'body\n' > "$case_aa/body.md"
+NO_TIMEOUT_PATH="$case_aa/fakebin:$case_aa/bin"
+bounding_tool=$(PATH="$NO_TIMEOUT_PATH" /bin/bash -c 'command -v timeout || command -v gtimeout' 2>/dev/null) || true
+[ -z "$bounding_tool" ] ||
+  fail "the fixture must expose no bounding binary, or it tests the wrapper again (found: $bounding_tool)"
+
+export FM_TEST_GH_AXI_LOG="$case_aa/gh.log"
+: > "$FM_TEST_GH_AXI_LOG"
+started=$(date +%s)
+set +e
+out=$(PATH="$NO_TIMEOUT_PATH" FM_PROPLANE_AGENT_CONFIG="$UNIT_LADDER_CONFIG" FM_PROPLANE_PR_GH_TIMEOUT=2 \
+  /bin/bash -c '
+  . "$(dirname "$1")/fm-proplane-agent-branches-lib.sh"
+  . "$1"
+  fm_proplane_promote_pr_sync "$2" main prakrit "t" "$3" 0
+' _ "$PR_LIB" "$case_aa/repo" "$case_aa/body.md" 2>&1)
+rc=$?
+set -e
+elapsed=$(( $(date +%s) - started ))
+expect_code 1 "$rc" 'a hung GitHub call must be reported as a bounded failure'
+[ "$elapsed" -lt 60 ] ||
+  fail "the call must be bounded with no timeout binary (took ${elapsed}s against a 2s bound)"
+assert_contains "$out" 'could not list open PRs' 'the bounded failure names the call that hung'
+assert_no_grep 'pr create' "$FM_TEST_GH_AXI_LOG" 'a call the bound killed must not fall through to a create'
+pass 'a hung GitHub call is bounded and reported even with no timeout binary on PATH'
+
+# The bound must not cost anything when nothing hangs: the call still runs, its
+# output still comes back, and the record is still opened.
+case_aa2="$TMP_ROOT/aa-passing"
+mkdir -p "$case_aa2"
+make_repo "$case_aa2/repo"
+make_gh_axi "$case_aa2/fakebin" none
+make_no_timeout_bin "$case_aa2/bin"
+printf 'body\n' > "$case_aa2/body.md"
+export FM_TEST_GH_AXI_LOG="$case_aa2/gh.log"
+: > "$FM_TEST_GH_AXI_LOG"
+out=$(PATH="$case_aa2/fakebin:$case_aa2/bin" FM_PROPLANE_AGENT_CONFIG="$UNIT_LADDER_CONFIG" \
+  /bin/bash -c '
+  . "$(dirname "$1")/fm-proplane-agent-branches-lib.sh"
+  . "$1"
+  fm_proplane_promote_pr_sync "$2" main prakrit "promote(ladder): prakrit -> main (aaa..bbb)" "$3" 0
+' _ "$PR_LIB" "$case_aa2/repo" "$case_aa2/body.md" 2>&1) ||
+  fail "an unbounded-tool host must still open the record: $out"
+assert_grep 'pr create --repo PrakritR/PropLane' "$FM_TEST_GH_AXI_LOG" 'the record is still opened'
+assert_contains "$out" 'https://github.com/PrakritR/PropLane/pull/91' 'the call output still reaches the caller'
+pass 'the shell-level bound passes a healthy call through untouched'
+
 # --- (l) an open PR that is not a promotion record is never rewritten ---------
 #
 # Reuse rests on gh-axi honoring --base/--head. If that ever stops holding, the
@@ -684,6 +782,83 @@ assert_contains "$log" 'pr edit 77 --repo PrakritR/PropLane --title' 'the record
 assert_not_contains "$log" 'pr create' 'a found record is never duplicated'
 assert_not_contains "$out" 'rather than rewriting an unrelated PR' 'a found record is not reported as missing'
 pass 'the reuse scan reads past the first row to find the promotion record'
+
+# --- (dd) reusing a record retires a stale "did not land" annotation ----------
+#
+# A fast-forward that fails annotates the open record so it never claims a
+# promotion that did not happen. The next run finds that same still-open record
+# and rewrites its body for a promotion that DOES land, and the annotation stays
+# put — so the record would carry a body saying it landed and a comment saying it
+# did not. That is the same falsehood the annotation exists to prevent, inverted.
+
+run_reuse_sync() {
+  local case_dir=$1
+  PATH="$case_dir/fakebin:$PATH" FM_PROPLANE_AGENT_CONFIG="$UNIT_LADDER_CONFIG" bash -c '
+    . "$(dirname "$1")/fm-proplane-agent-branches-lib.sh"
+    . "$1"
+    fm_proplane_promote_pr_sync "$2" main prakrit "promote(ladder): prakrit -> main (ddd..eee)" "$3" 0
+  ' _ "$PR_LIB" "$case_dir/repo" "$case_dir/body.md" 2>&1
+}
+
+case_dd="$TMP_ROOT/dd"
+mkdir -p "$case_dd"
+make_repo "$case_dd/repo"
+make_gh_axi "$case_dd/fakebin" annotated
+printf 'body\n' > "$case_dd/body.md"
+export FM_TEST_GH_AXI_LOG="$case_dd/gh.log"
+: > "$FM_TEST_GH_AXI_LOG"
+out=$(run_reuse_sync "$case_dd") || fail "reuse should succeed: $out"
+log=$(cat "$FM_TEST_GH_AXI_LOG")
+assert_contains "$log" 'pr edit 77 --repo PrakritR/PropLane --title' 'the open record is still reused'
+assert_contains "$log" 'pr view 77 --repo PrakritR/PropLane --comments' 'the reused record is read for a stale annotation'
+assert_contains "$log" 'pr comment 77 --repo PrakritR/PropLane' 'the stale annotation is superseded on the record itself'
+assert_contains "$log" 'this record has been rewritten for a later promotion run' \
+  'the superseding note says the record now describes a different promotion'
+assert_contains "$out" 'superseded the earlier not-landed annotation' 'the supersede is reported'
+pass 'reusing an annotated record retires the annotation that contradicts it'
+
+# Once retired, it stays retired: a third run must not stack another note on a
+# record whose newest word already says the annotation above it is stale.
+case_dd2="$TMP_ROOT/dd-already"
+mkdir -p "$case_dd2"
+make_repo "$case_dd2/repo"
+make_gh_axi "$case_dd2/fakebin" annotated-superseded
+printf 'body\n' > "$case_dd2/body.md"
+export FM_TEST_GH_AXI_LOG="$case_dd2/gh.log"
+: > "$FM_TEST_GH_AXI_LOG"
+out=$(run_reuse_sync "$case_dd2") || fail "reuse should succeed: $out"
+assert_grep 'pr view 77' "$FM_TEST_GH_AXI_LOG" 'the record is still checked'
+assert_no_grep 'pr comment' "$FM_TEST_GH_AXI_LOG" 'an already-superseded annotation is not superseded again'
+pass 'an annotation already retired is not annotated over on every re-run'
+
+# A record with no annotation on it gets no note at all, and a comment thread
+# that cannot be read is warned about without turning a published record into a
+# reported publishing failure.
+case_dd3="$TMP_ROOT/dd-clean"
+mkdir -p "$case_dd3"
+make_repo "$case_dd3/repo"
+make_gh_axi "$case_dd3/fakebin" existing
+printf 'body\n' > "$case_dd3/body.md"
+export FM_TEST_GH_AXI_LOG="$case_dd3/gh.log"
+: > "$FM_TEST_GH_AXI_LOG"
+out=$(run_reuse_sync "$case_dd3") || fail "reuse should succeed: $out"
+assert_no_grep 'pr comment' "$FM_TEST_GH_AXI_LOG" 'an unannotated record collects no note'
+
+case_dd4="$TMP_ROOT/dd-unreadable"
+mkdir -p "$case_dd4"
+make_repo "$case_dd4/repo"
+make_gh_axi "$case_dd4/fakebin" view-fails
+printf 'body\n' > "$case_dd4/body.md"
+export FM_TEST_GH_AXI_LOG="$case_dd4/gh.log"
+: > "$FM_TEST_GH_AXI_LOG"
+set +e
+out=$(run_reuse_sync "$case_dd4")
+rc=$?
+set -e
+expect_code 0 "$rc" 'an unreadable comment thread must not fail a record that was updated'
+assert_contains "$out" 'updated promotion record PR #77' 'the record is still reported as updated'
+assert_contains "$out" 'may still say this promotion did not land' 'the unread thread is warned about'
+pass 'a comment thread that cannot be read warns without failing the published record'
 
 # --- end-to-end promotion fixtures -------------------------------------------
 
@@ -1127,17 +1302,54 @@ fm_proplane_promote_pr_repo_from_url 'https://github.com/onlyowner' >/dev/null 2
   fail 'an owner with no repository name must not resolve'
 pass 'a repository is read only from a remote that actually names one'
 
-# The configured destination wins over anything the clone would imply.
+# (bb) The config reader lives in another library. If it is not loaded the call
+# returns 127 with its message suppressed, which reads exactly like "no
+# GITHUB_REPO row is configured" — and a config that declares one repository
+# would then silently resolve to the clone's origin, which is a different one.
 git -C "$case_dest/repo" remote set-url origin https://github.com/SomeoneElse/wrong.git
+set +e
+out=$(FM_PROPLANE_AGENT_CONFIG="$UNIT_LADDER_CONFIG" bash -c '
+  . "$1"
+  fm_proplane_promote_pr_repo "$2"
+' _ "$PR_LIB" "$case_dest/repo" 2>&1)
+rc=$?
+set -e
+expect_code 1 "$rc" 'a destination that cannot read its config must refuse'
+assert_contains "$out" 'fm_proplane_agent_github_repo' 'the refusal names the reader that is missing'
+assert_not_contains "$out" 'SomeoneElse/wrong' 'a missing reader must never fall through to the clone origin'
+pass 'a config reader that is not loaded refuses instead of resolving to the clone'
+
+# The configured destination wins over anything the clone would imply.
 printf 'GIT_ROOT\t%s\n' "$case_dest/repo" > "$case_dest/home/config/proplane-agent-branches"
 printf 'GITHUB_REPO\t%s\n' 'PrakritR/PropLane' >> "$case_dest/home/config/proplane-agent-branches"
 FM_PROPLANE_AGENT_CONFIG="$case_dest/home/config/proplane-agent-branches"
 export FM_PROPLANE_AGENT_CONFIG
 # shellcheck source=bin/fm-proplane-agent-branches-lib.sh
 . "$ROOT/bin/fm-proplane-agent-branches-lib.sh"
-[ "$(fm_proplane_promote_pr_repo "$case_dest/repo")" = 'PrakritR/PropLane' ] ||
+[ "$(fm_proplane_promote_pr_repo "$case_dest/repo" 2>/dev/null)" = 'PrakritR/PropLane' ] ||
   fail 'the configured GITHUB_REPO must win'
 pass 'the ladder config decides the destination when it declares one'
+
+# (cc) The ladder PUSHES to origin and PUBLISHES to the declared row. A stale or
+# typo'd row therefore opens a record in a repository holding none of the
+# promoted shas: it would cite commits that are not there and never close as
+# merged. The declared row still wins — inferring one is the bug this whole
+# resolution refuses to commit — but the disagreement is named.
+mismatch=$(fm_proplane_promote_pr_repo "$case_dest/repo" 2>&1 >/dev/null)
+assert_contains "$mismatch" 'SomeoneElse/wrong' 'the warning names the repository the ladder actually pushes to'
+assert_contains "$mismatch" 'PrakritR/PropLane' 'the warning names the declared destination it is publishing to'
+assert_contains "$mismatch" 'never close as merged' 'the warning says what goes wrong'
+pass 'a declared destination that is not the push target is warned about, not overridden'
+
+# Agreement is silent, and case alone is not a disagreement: GitHub resolves
+# owner and repository names case-insensitively, so a row that differs only in
+# case names the same place and must not be reported as a mismatch.
+git -C "$case_dest/repo" remote set-url origin https://github.com/prakritr/proplane.git
+[ -z "$(fm_proplane_promote_pr_repo "$case_dest/repo" 2>&1 >/dev/null)" ] ||
+  fail 'a declared destination matching origin must warn about nothing'
+pass 'a declared destination that matches the push target warns about nothing'
+
+git -C "$case_dest/repo" remote set-url origin https://github.com/SomeoneElse/wrong.git
 
 # With no declared destination it falls back to the git root's OWN origin, which
 # is still explicit: it is that clone's remote, not a parent the tool inferred.

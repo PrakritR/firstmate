@@ -63,6 +63,8 @@
 #     AND its title marks it as a promotion record, otherwise creates one. Sets
 #     FM_PROPLANE_PROMOTE_PR_OPENED to 1 once a record exists, and
 #     FM_PROPLANE_PROMOTE_PR_NUMBER and _URL to that record when they are known.
+#     Reusing a record also retires an earlier "did not land" annotation on it,
+#     so a rewritten record never carries a body and a comment that contradict.
 #     <dry_run>=1 prints the PR it would open and makes no GitHub call.
 #   fm_proplane_promote_pr_comment <git_root> <number> <message> <dry_run>
 #     Annotate an already-opened record, for when the promotion it describes did
@@ -72,6 +74,9 @@
 #   fm_proplane_promote_pr_repo <git_root>
 #     The OWNER/NAME every call above publishes to: the ladder config's
 #     GITHUB_REPO row, else that git root's own origin remote, else a refusal.
+#     A declared row wins outright, and is warned about when it names a different
+#     repository than the origin this git root pushes to, because the record
+#     would then cite commits its destination does not have.
 #   fm_proplane_promote_pr_repo_from_url <url>
 #     OWNER/NAME out of a github.com remote URL, or nothing when it cannot be
 #     read with confidence.
@@ -92,6 +97,17 @@ FM_PROPLANE_PR_GH_TIMEOUT=${FM_PROPLANE_PR_GH_TIMEOUT:-60}
 # title builder and the reuse guard so the two can never drift apart.
 FM_PROPLANE_PR_TITLE_PREFIX='promote(ladder): prakrit -> main'
 
+# The sentence a failed fast-forward leaves on a record it already opened, and
+# the sentence that retires it when a later promotion rewrites that same record.
+# Both live here because three places have to agree on them: the caller that
+# posts the failure annotation, the reuse path that looks for a stale one, and
+# the note that supersedes it. A record that carries a body describing a
+# promotion that landed and a comment asserting it did not is the exact
+# falsehood the annotation exists to prevent, only inverted.
+# shellcheck disable=SC2016  # single quotes are deliberate: the backticks are markdown code fencing in the posted comment, not a command substitution.
+FM_PROPLANE_PR_FAILED_MARKER='the fast-forward of `main` did NOT complete'
+FM_PROPLANE_PR_SUPERSEDED_MARKER='this record has been rewritten for a later promotion run'
+
 # Open PRs the reuse scan reads. The scan stops at the first promotion record it
 # sees, so the only cost of a wider listing is the rows gh-axi prints, while too
 # narrow a listing hides the record behind any unrelated PR for the same pair.
@@ -104,15 +120,62 @@ FM_PROPLANE_PROMOTE_PR_OPENED=0
 FM_PROPLANE_PROMOTE_PR_NUMBER=''
 FM_PROPLANE_PROMOTE_PR_URL=''
 
-# Bounded network call. Prefers timeout, falls back to gtimeout, and runs the
-# call bare when neither is installed rather than refusing to record anything.
+# Bound a call with no external tool at all: run it in its own process group,
+# poll for it, and kill that whole group when the bound expires. The group is
+# what makes this work — a hung `gh-axi` holds the caller's output pipe open
+# through any child it spawned, so killing the leader alone would leave the
+# command substitution reading a pipe nobody will ever close, which is the hang
+# this exists to prevent.
+#
+# Exits 124 on expiry, the same code the real `timeout` reports, so every caller
+# treats a bound that fired as the ordinary warn-and-continue failure it is.
+fm_proplane_promote_pr_watchdog() {
+  local limit=$1
+  shift
+  local pid rc waited=0 monitor_was_on=0
+  # Monitor mode is what puts the background job in its own process group. It is
+  # restored afterwards so a caller that had job control on keeps it.
+  case $- in *m*) monitor_was_on=1 ;; esac
+  set -m
+  "$@" &
+  pid=$!
+  [ "$monitor_was_on" -eq 1 ] || set +m
+  # Elapsed time is counted in whole polled seconds rather than read from
+  # SECONDS: bash 3.2, which is the system bash this ladder runs under, drops
+  # that variable's special meaning once a function makes it local, and a
+  # watchdog whose clock never advances is worse than no watchdog at all.
+  while [ "$waited" -lt "$limit" ]; do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 1
+    waited=$((waited + 1))
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -TERM "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
+    sleep 1
+    kill -KILL "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null
+    return 124
+  fi
+  if wait "$pid"; then
+    rc=0
+  else
+    rc=$?
+  fi
+  return "$rc"
+}
+
+# Bounded network call. Prefers timeout, falls back to gtimeout, and bounds the
+# call in the shell itself when neither is installed. The fallback is not a
+# theoretical branch: macOS ships neither binary, so on the machine this ladder
+# runs on it is the ONLY thing standing between a hung GitHub call and a
+# promotion wedged between its passing gates and the fast-forward of main.
 fm_proplane_promote_pr_bounded() {
   if command -v timeout >/dev/null 2>&1; then
     timeout "$FM_PROPLANE_PR_GH_TIMEOUT" "$@"
   elif command -v gtimeout >/dev/null 2>&1; then
     gtimeout "$FM_PROPLANE_PR_GH_TIMEOUT" "$@"
   else
-    "$@"
+    fm_proplane_promote_pr_watchdog "$FM_PROPLANE_PR_GH_TIMEOUT" "$@"
   fi
 }
 
@@ -142,6 +205,21 @@ fm_proplane_promote_pr_repo_from_url() {
   esac
 }
 
+# OWNER/NAME of the repository this git root pushes to, or nothing when origin is
+# absent or is not a github.com remote this can read with confidence.
+fm_proplane_promote_pr_origin_repo() {
+  local git_root=$1 url
+  url=$(git -C "$git_root" remote get-url origin 2>/dev/null) || return 1
+  [ -n "$url" ] || return 1
+  fm_proplane_promote_pr_repo_from_url "$url"
+}
+
+# Case-folded, because GitHub treats owner and repository names case-insensitively
+# and a config row that differs from origin only in case names the same place.
+fm_proplane_promote_pr_fold() {
+  printf '%s\n' "$1" | tr '[:upper:]' '[:lower:]'
+}
+
 # The repository this promotion record is published to, as OWNER/NAME, resolved
 # from the ladder's own configuration and never from ambient tooling defaults.
 #
@@ -153,8 +231,31 @@ fm_proplane_promote_pr_repo_from_url() {
 # unrecorded promotion is recoverable, a promotion published to someone else's
 # repository is not.
 fm_proplane_promote_pr_repo() {
-  local git_root=$1 repo url
+  local git_root=$1 repo url origin_repo
+  # A reader that is not loaded returns 127 with its message suppressed, which is
+  # indistinguishable from "no GITHUB_REPO row is configured" — and that silence
+  # would resolve a config declaring one repository to the clone's origin, which
+  # is another repository nobody named for this record. Refusing here is the same
+  # stance the rest of this function takes: never publish on a fallback the
+  # operator did not choose.
+  if ! declare -F fm_proplane_agent_github_repo >/dev/null 2>&1; then
+    echo "proplane-promote-pr: the ladder config reader fm_proplane_agent_github_repo is not loaded, so a declared GITHUB_REPO row cannot be read" >&2
+    echo "proplane-promote-pr: source bin/fm-proplane-agent-branches-lib.sh before this library; refusing rather than resolving the destination from the clone" >&2
+    return 1
+  fi
   if repo=$(fm_proplane_agent_github_repo 2>/dev/null) && [ -n "$repo" ]; then
+    # The declared row still wins: it is the operator's explicit statement of
+    # where this record belongs. But the ladder PUSHES to origin, so a stale or
+    # typo'd row publishes a record into a repository that has none of the
+    # promoted shas — it would cite commits that are not there and never close as
+    # merged. Naming the disagreement is what catches that; deciding it here
+    # would be the inference this whole function refuses to make.
+    origin_repo=$(fm_proplane_promote_pr_origin_repo "$git_root") || origin_repo=""
+    if [ -n "$origin_repo" ] &&
+      [ "$(fm_proplane_promote_pr_fold "$origin_repo")" != "$(fm_proplane_promote_pr_fold "$repo")" ]; then
+      echo "proplane-promote-pr: WARNING the ladder config publishes this record to $repo, but $git_root pushes to origin $origin_repo" >&2
+      echo "proplane-promote-pr: $repo may hold none of the promoted commits, so the record would cite commits it does not have and would never close as merged; publishing to the declared $repo — correct the GITHUB_REPO row if that is wrong" >&2
+    fi
     printf '%s\n' "$repo"
     return 0
   fi
@@ -454,6 +555,38 @@ fm_proplane_promote_pr_number_from_url() {
   printf '%s\n' "$1" | sed -n 's#.*/pull/\([0-9][0-9]*\).*#\1#p' | head -n 1 || true
 }
 
+# Retire a stale "did NOT complete" annotation on a record this run has just
+# rewritten for a promotion of its own. Posts nothing unless the newest of the
+# two markers is the failure one, so a re-run that already superseded an
+# annotation does not stack another note on top of it every time.
+#
+# Ordering carries the meaning: this note is posted BEFORE the fast-forward, so a
+# fast-forward that then fails annotates after it and the record still reads in
+# sequence — rewritten, then failed again. Every failure here is reported and
+# stepped over; the record was already updated, and an unread comment thread
+# must never turn a published record into a reported publishing failure.
+fm_proplane_promote_pr_supersede_annotation() {
+  local repo=$1 number=$2 comments out message
+  comments=$(fm_proplane_promote_pr_gh pr view "$number" --repo "$repo" --comments 2>&1) || {
+    echo "proplane-promote-pr: could not read the comments on promotion record PR #$number, so an earlier annotation there may still say this promotion did not land" >&2
+    printf '%s\n' "$comments" >&2
+    return 1
+  }
+  printf '%s\n' "$comments" | awk -v failed="$FM_PROPLANE_PR_FAILED_MARKER" \
+    -v superseded="$FM_PROPLANE_PR_SUPERSEDED_MARKER" '
+    index($0, failed) { f = NR }
+    index($0, superseded) { s = NR }
+    END { exit !(f > s) }' || return 0
+  message="proplane-promote-pr: $FM_PROPLANE_PR_SUPERSEDED_MARKER. The earlier annotation above describes a promotion attempt that did not land; it does not describe the range this record now states, and the ladder fast-forwards \`main\` to that range right after this rewrite."
+  out=$(fm_proplane_promote_pr_gh pr comment "$number" --repo "$repo" --body "$message" 2>&1) || {
+    echo "proplane-promote-pr: could not supersede the earlier annotation on promotion record PR #$number, which still says this promotion did not land" >&2
+    printf '%s\n' "$out" >&2
+    return 1
+  }
+  echo "proplane-promote-pr: superseded the earlier not-landed annotation on promotion record PR #$number"
+  return 0
+}
+
 fm_proplane_promote_pr_sync() {
   local git_root=$1 base=$2 head=$3 title=$4 body_file=$5 dry_run=${6:-0}
   local listing number out url repo
@@ -523,6 +656,12 @@ fm_proplane_promote_pr_sync() {
     FM_PROPLANE_PROMOTE_PR_OPENED=1
     FM_PROPLANE_PROMOTE_PR_NUMBER=$number
     echo "proplane-promote-pr: updated promotion record PR #$number"
+    # The record just rewritten may be one an earlier run annotated as not having
+    # landed. Its body now describes THIS promotion, so that annotation has to be
+    # retired or the record asserts both at once. Failing to retire it is warned
+    # about and nothing more: the record itself was updated, and reporting that
+    # as a failed publish would have the caller warn that no record exists.
+    fm_proplane_promote_pr_supersede_annotation "$repo" "$number" || true
   else
     out=$(fm_proplane_promote_pr_gh pr create --repo "$repo" --base "$base" --head "$head" \
       --title "$title" --body-file "$body_file" 2>&1) || {
