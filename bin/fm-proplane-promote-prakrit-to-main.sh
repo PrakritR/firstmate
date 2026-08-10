@@ -106,6 +106,35 @@ run_no_mistakes() {
   )
 }
 
+# `no-mistakes axi run` exits 0 when it PARKS at a gate — parking is a decision
+# point, not an error — so `run_no_mistakes || exit 1` never fired and the script
+# walked straight on to pushing main. Both promotes on 2026-08-10 shipped to
+# production while the review gate sat at `awaiting_approval`; the second run was
+# still parked ~7h after production had been pushed.
+#
+# Fails CLOSED: the push proceeds only when the run is positively confirmed
+# finished. An unreadable status, a still-running run, or any awaiting_* state
+# all refuse, because "could not tell" must never mean "ship it".
+assert_no_mistakes_completed() {
+  local status_out
+  if ! status_out="$(cd "$GIT_ROOT" && no-mistakes axi status 2>&1)"; then
+    echo "proplane-promote-main: could not read no-mistakes status — refusing to push main" >&2
+    return 1
+  fi
+  if printf '%s' "$status_out" | grep -qiE "awaiting_approval|awaiting_agent|parked"; then
+    echo "proplane-promote-main: no-mistakes is PARKED at a gate — refusing to push main." >&2
+    echo "  Drive it with: no-mistakes axi respond --action <approve|fix|skip> [--findings <ids>]" >&2
+    echo "  Then re-run with --validate-only, and only then --push-main." >&2
+    return 1
+  fi
+  if printf '%s' "$status_out" | grep -qiE "^[[:space:]]*status:[[:space:]]*(running|failed|cancelled)"; then
+    echo "proplane-promote-main: no-mistakes run did not pass — refusing to push main." >&2
+    printf '%s\n' "$status_out" | head -20 >&2
+    return 1
+  fi
+  return 0
+}
+
 merge_and_push_main() {
   echo "== fast-forward main from $INTEGRATE_BRANCH =="
   run_git "$GIT_ROOT" fetch origin main || return 1
@@ -129,7 +158,7 @@ sync_prakrit_from_main() {
       -m "merge(main): keep integration aligned after main promote" || return 1
   fi
   run_git "$prakrit_worktree" push origin prakrit || return 1
-  local sync_args=(--reset-from-prakrit)
+  local sync_args=(--reset-from-prakrit --no-restart)
   [ "$FORCE" -eq 1 ] && sync_args+=(--force)
   if [ "$DRY_RUN" -eq 1 ]; then
     echo "DRY fm-prakrit-sync-agent-branches.sh ${sync_args[*]}"
@@ -200,6 +229,10 @@ main() {
     echo "proplane-promote-main: validation complete — test on http://localhost:3000"
     echo "proplane-promote-main: no push yet. After you approve, run with --push-main (no PR unless you ask)."
     exit 0
+  fi
+
+  if [ "$SKIP_GATES" -eq 0 ] && [ "$DRY_RUN" -eq 0 ]; then
+    assert_no_mistakes_completed || exit 1
   fi
 
   merge_and_push_main || exit 1
