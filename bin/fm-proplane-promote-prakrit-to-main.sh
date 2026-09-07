@@ -158,7 +158,8 @@ sync_prakrit_from_main() {
       -m "merge(main): keep integration aligned after main promote" || return 1
   fi
   run_git "$prakrit_worktree" push origin prakrit || return 1
-  local sync_args=(--reset-from-prakrit --no-restart)
+  # Merge-only sandbox sync — never hard-reset lanes to prakrit from promote.
+  local sync_args=(--no-restart)
   [ "$FORCE" -eq 1 ] && sync_args+=(--force)
   if [ "$DRY_RUN" -eq 1 ]; then
     echo "DRY fm-prakrit-sync-agent-branches.sh ${sync_args[*]}"

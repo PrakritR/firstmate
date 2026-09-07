@@ -2,16 +2,20 @@
 # Sync PropPlane agent sandboxes from origin/prakrit and refresh localhost review servers.
 #
 # Standing captain order (2026-07-28): whenever origin/prakrit moves, each keeper
-# sandbox (claude-1, claude-2, cursor-1, cursor-2) receives prakrit locally, pushes
+# sandbox (claude-1, cursor-1, cursor-2, codex-1, codex-2) receives prakrit locally, pushes
 # its branch, and restarts its dev server. After an agent promotes into prakrit, use
-# --reset-from-prakrit so every sandbox matches integration exactly.
+# --reset-from-prakrit so sandboxes whose tip is already contained in prakrit match
+# integration exactly. Lanes with unique commits ahead are never hard-reset — they
+# merge prakrit instead (see sync_sandbox).
 #
 # Usage:
-#   fm-prakrit-sync-agent-branches.sh                    # sync all sandboxes
+#   fm-prakrit-sync-agent-branches.sh                    # sync all sandboxes (no dev-server restart)
 #   fm-prakrit-sync-agent-branches.sh cursor-1           # one branch
 #   fm-prakrit-sync-agent-branches.sh --reset-from-prakrit
 #   fm-prakrit-sync-agent-branches.sh --dry-run
-#   fm-prakrit-sync-agent-branches.sh --no-restart
+#   fm-prakrit-sync-agent-branches.sh --restart         # restart dev servers for branches synced here
+#   fm-prakrit-sync-agent-branches.sh --restart --all   # restart every synced branch (memory-heavy)
+#   fm-prakrit-sync-agent-branches.sh --no-restart      # explicit no restart (default)
 #   fm-prakrit-sync-agent-branches.sh --no-push
 set -eu
 
@@ -23,7 +27,8 @@ FM_HOME="${FM_HOME:-$FM_ROOT}"
 . "$SCRIPT_DIR/fm-proplane-agent-branches-lib.sh"
 
 DRY_RUN=0
-NO_RESTART=0
+NO_RESTART=1
+RESTART_ALL=0
 NO_PUSH=0
 RESET_FROM_PRAKRIT=0
 FORCE=0
@@ -32,13 +37,20 @@ for arg in "$@"; do
   case "$arg" in
     --dry-run) DRY_RUN=1 ;;
     --no-restart) NO_RESTART=1 ;;
+    --restart) NO_RESTART=0 ;;
+    --all) RESTART_ALL=1 ;;
     --no-push) NO_PUSH=1 ;;
     --reset-from-prakrit) RESET_FROM_PRAKRIT=1 ;;
     --force) FORCE=1 ;;
     --help|-h)
-      echo "usage: fm-prakrit-sync-agent-branches.sh [--dry-run] [--no-restart] [--no-push] [--reset-from-prakrit] [--force] [branch]"
-      echo "  --reset-from-prakrit  hard-reset each sandbox to origin/prakrit; refuses on a"
-      echo "                        worktree with uncommitted work unless --force is given"
+      echo "usage: fm-prakrit-sync-agent-branches.sh [--dry-run] [--restart] [--all] [--no-restart] [--no-push] [--reset-from-prakrit] [--force] [branch]"
+      echo "  default: git sync only — dev servers are not restarted (use --restart to opt in)"
+      echo "  --restart  restart localhost for each branch synced in this run"
+      echo "  --all      with --restart, restart every synced branch; without [branch], same as all"
+      echo "  --reset-from-prakrit  request hard-reset to origin/prakrit; IGNORED unless"
+      echo "                        FM_ALLOW_PRAKRIT_HARD_RESET=1 is also set. Even then,"
+      echo "                        only resets when the sandbox tip is already contained"
+      echo "                        in prakrit; otherwise merges (never destroys unique commits)."
       echo "  --force               CAPTAIN-AUTHORIZED ONLY: discard uncommitted sandbox work"
       exit 0
       ;;
@@ -51,6 +63,16 @@ for arg in "$@"; do
       ;;
   esac
 done
+
+should_restart_branch() {
+  local branch=$1
+  [ "$NO_RESTART" -eq 0 ] || return 1
+  if [ -n "$ONLY_BRANCH" ]; then
+    [ "$branch" = "$ONLY_BRANCH" ]
+    return
+  fi
+  [ "$RESTART_ALL" -eq 1 ]
+}
 
 GIT_ROOT=$(fm_proplane_agent_git_root) || {
   echo "proplane-prakrit-sync: missing GIT_ROOT in $FM_PROPLANE_AGENT_CONFIG" >&2
@@ -100,7 +122,7 @@ sync_prakrit_integration() {
     fi
     run_git "$worktree" reset --hard "origin/$branch" || return 1
   fi
-  if [ "$NO_RESTART" -eq 0 ] && [ "$DRY_RUN" -eq 0 ]; then
+  if should_restart_branch "$branch" && [ "$DRY_RUN" -eq 0 ]; then
     "$SCRIPT_DIR/fm-proplane-dev-server.sh" restart "$worktree" "$port" || true
   fi
 }
@@ -123,11 +145,35 @@ sync_sandbox() {
   fi
 
   if [ "$RESET_FROM_PRAKRIT" -eq 1 ]; then
-    if [ "$DRY_RUN" -eq 0 ]; then
+    # Hard-reset to origin/prakrit is opt-in twice: the flag AND
+    # FM_ALLOW_PRAKRIT_HARD_RESET=1. Promote paths used to pass the flag
+    # unconditionally and wiped lanes ahead of prakrit (claude-3 5d02d838 /
+    # 5dce1126). Default posture is merge-only.
+    if [ "${FM_ALLOW_PRAKRIT_HARD_RESET:-}" != "1" ]; then
+      echo "proplane-prakrit-sync: --reset-from-prakrit ignored (set FM_ALLOW_PRAKRIT_HARD_RESET=1 to allow hard-reset)" >&2
+      echo "  merging origin/prakrit into $branch instead (never destroys unique commits)" >&2
+      if run_git "$worktree" merge-base --is-ancestor "origin/prakrit" HEAD 2>/dev/null; then
+        echo "proplane-prakrit-sync: $branch already contains origin/prakrit"
+      elif ! run_git "$worktree" merge --no-edit "origin/prakrit" -m "chore(sync): prakrit into $branch"; then
+        echo "proplane-prakrit-sync: BLOCKED merge conflict on $branch — resolve in $worktree" >&2
+        return 1
+      fi
+    elif [ "$DRY_RUN" -eq 0 ]; then
       fm_proplane_assert_resettable "$worktree" "proplane-prakrit-sync" "$FORCE" || return 1
+      # Even with the env gate, hard-reset only when this tip is already in
+      # prakrit. --force only authorizes discarding a dirty working tree.
+      if run_git "$worktree" merge-base --is-ancestor HEAD origin/prakrit 2>/dev/null; then
+        echo "proplane-prakrit-sync: reset $branch to origin/prakrit (local tip already contained)"
+        run_git "$worktree" reset --hard "origin/prakrit" || return 1
+      else
+        echo "proplane-prakrit-sync: SKIP reset $branch — HEAD has commits not in origin/prakrit" >&2
+        echo "  refusing to destroy unique sandbox work; merging prakrit instead" >&2
+        if ! run_git "$worktree" merge --no-edit "origin/prakrit" -m "chore(sync): prakrit into $branch"; then
+          echo "proplane-prakrit-sync: BLOCKED merge conflict on $branch — resolve in $worktree" >&2
+          return 1
+        fi
+      fi
     fi
-    echo "proplane-prakrit-sync: reset $branch to origin/prakrit"
-    run_git "$worktree" reset --hard "origin/prakrit" || return 1
   elif run_git "$worktree" merge-base --is-ancestor "origin/prakrit" HEAD 2>/dev/null; then
     echo "proplane-prakrit-sync: $branch already contains origin/prakrit"
   else
@@ -141,7 +187,8 @@ sync_sandbox() {
     if [ "$NO_PUSH" -eq 0 ]; then
       run_git "$worktree" push origin "$branch"
     fi
-    if [ "$NO_RESTART" -eq 0 ]; then
+    "$SCRIPT_DIR/fm-proplane-write-agent-branch-rule.sh" "$branch" "$worktree" "$port"
+    if should_restart_branch "$branch"; then
       "$SCRIPT_DIR/fm-proplane-dev-server.sh" restart "$worktree" "$port" || true
     fi
   fi
